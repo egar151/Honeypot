@@ -204,6 +204,32 @@ WantedBy=multi-user.target
 - Admin 403: Ensure you set `HONEYPOT_ADMIN_TOKEN` and passed `?token=...` or `X-Admin-Token` header.
 - No IP in logs behind proxy: Confirm your reverse proxy sets `X-Forwarded-For` and only your proxy can reach the app.
 
+## Purge or reset the database
+
+Fully delete the database file (fresh start):
+
+1) Stop the app (Ctrl-C or stop your service).
+2) Delete the file:
+
+- macOS/Linux:
+  - `rm -f honeypot.db`
+- Windows (PowerShell):
+  - `Remove-Item -Force .\honeypot.db`
+
+3) Recreate schema:
+
+- If you run `python app.py`, the schema is created automatically on start.
+- If you run under Gunicorn (e.g., `gunicorn app:app`), initialize once via:
+  - `python -c "import app; app.init_db()"`
+
+Wipe contents but keep the file (optional):
+
+1) Stop the app.
+2) Run:
+
+- `sqlite3 honeypot.db "DELETE FROM requests; DELETE FROM login_attempts; DELETE FROM actors; VACUUM;"`
+
+
 
 ## Database schema
 
