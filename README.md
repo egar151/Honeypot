@@ -229,6 +229,11 @@ Wipe contents but keep the file (optional):
 
 - `sqlite3 honeypot.db "DELETE FROM requests; DELETE FROM login_attempts; DELETE FROM actors; VACUUM;"`
 
+## Legal
+
+- Product of Chimera Labs.
+- Copyright © 2025 Chimera Labs. All rights reserved.
+
 
 
 ## Database schema
