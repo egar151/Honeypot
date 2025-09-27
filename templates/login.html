@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block content %}
+  <div class="panel">
+    <h2>Login</h2>
+    {% if message %}
+      <div class="alert">{{ message }}</div>
+    {% endif %}
+    <form method="post" action="{{ url_for('login') }}" autocomplete="off" novalidate>
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required />
+
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required />
+
+      <button type="submit">Sign in</button>
+    </form>
+  </div>
+{% endblock %}
+

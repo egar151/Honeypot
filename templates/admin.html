@@ -1,0 +1,102 @@
+{% extends 'base.html' %}
+{% block content %}
+  <style>
+    /* Make admin page wider and prevent truncation */
+    .container { max-width: 1200px; }
+    .table .truncate { max-width: none; white-space: normal; }
+  </style>
+  <div class="panel">
+    <h2>Admin — Read Only</h2>
+    <form method="get" action="{{ url_for('admin') }}" class="filters">
+      <div class="row">
+        <label>IP
+          <input type="text" name="ip" value="{{ ip }}" placeholder="1.2.3.4" />
+        </label>
+        <label>User-Agent contains
+          <input type="text" name="ua" value="{{ ua }}" placeholder="curl" />
+        </label>
+        <label>Path contains
+          <input type="text" name="path" value="{{ path_q }}" placeholder="/login" />
+        </label>
+      </div>
+      <div class="row">
+        <label>Type
+          <select name="type">
+            <option value="both" {% if qtype=='both' %}selected{% endif %}>Both</option>
+            <option value="requests" {% if qtype=='requests' %}selected{% endif %}>Requests</option>
+            <option value="logins" {% if qtype=='logins' %}selected{% endif %}>Logins</option>
+          </select>
+        </label>
+        <label>Last hours
+          <input type="number" name="hours" value="{{ hours }}" min="0" max="168" />
+        </label>
+        <label>Limit
+          <input type="number" name="limit" value="{{ limit }}" min="1" max="1000" />
+        </label>
+      </div>
+      <div class="row">
+        <button type="submit">Apply</button>
+      </div>
+    </form>
+  </div>
+
+  {% if qtype in ['both','requests'] %}
+  <div class="panel">
+    <h3>Recent Requests</h3>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Time (UTC)</th><th>IP:Port</th><th>Local</th><th>Method</th><th>Host</th><th>Path</th><th>Query</th><th>UA</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in req_rows %}
+          <tr>
+            <td>{{ r['id'] }}</td>
+            <td class="mono">{{ r['ts_utc'] }}</td>
+            <td class="mono">{{ r['ip'] }}{% if r['remote_port'] %}:{{ r['remote_port'] }}{% endif %}</td>
+            <td class="mono">{{ r['local_port'] or '' }}</td>
+            <td>{{ r['method'] }}</td>
+            <td class="mono">{{ r['host'] }}</td>
+            <td class="mono">{{ r['path'] }}</td>
+            <td class="mono">{{ r['query_string'] }}</td>
+            <td class="mono truncate" title="{{ r['user_agent'] }}">{{ r['user_agent'] }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if qtype in ['both','logins'] %}
+  <div class="panel">
+    <h3>Login Attempts</h3>
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Time (UTC)</th><th>IP</th><th>UA</th><th>User</th><th>Password</th><th>Success</th><th>#</th><th>Repeater</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for a in login_rows %}
+          <tr>
+            <td>{{ a['id'] }}</td>
+            <td class="mono">{{ a['ts_utc'] }}</td>
+            <td class="mono">{{ a['ip'] }}</td>
+            <td class="mono truncate" title="{{ a['user_agent'] }}">{{ a['user_agent'] }}</td>
+            <td class="mono">{{ a['username'] }}</td>
+            <td class="mono">{{ a['password'] }}</td>
+            <td>{{ 'yes' if a['success'] else 'no' }}</td>
+            <td>{{ a['attempt_number'] }}</td>
+            <td>{{ 'yes' if a['repeater'] else 'no' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+{% endblock %}

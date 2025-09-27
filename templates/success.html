@@ -1,0 +1,55 @@
+{% extends 'base.html' %}
+{% block content %}
+  <div class="panel center">
+    <h2>Congratulations, you broke in! 🎉</h2>
+    <p>Welcome to the system.</p>
+  </div>
+  <canvas id="confetti" style="position:fixed; inset:0; width:100%; height:100%; pointer-events:none;"></canvas>
+  <script>
+  (function() {
+    const canvas = document.getElementById('confetti');
+    const ctx = canvas.getContext('2d');
+    function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+    window.addEventListener('resize', resize, {passive:true});
+    resize();
+
+    const colors = ['#e91e63','#9c27b0','#3f51b5','#2196f3','#00bcd4','#4caf50','#ff9800','#ffeb3b'];
+    const pieces = [];
+    const N = 180;
+    function rand(min,max){ return Math.random()*(max-min)+min; }
+    for (let i=0;i<N;i++){
+      pieces.push({
+        x: rand(0, canvas.width),
+        y: rand(-canvas.height, 0),
+        r: rand(4,8),
+        w: rand(6,12),
+        h: rand(8,16),
+        a: rand(0, Math.PI*2),
+        s: rand(1.5,3.5),
+        rot: rand(-0.1,0.1),
+        color: colors[(Math.random()*colors.length)|0]
+      });
+    }
+    function step(){
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      for (const p of pieces){
+        p.y += p.s;
+        p.x += Math.sin(p.a+=0.02)*0.8;
+        p.rot += 0.02;
+        if (p.y - 20 > canvas.height){
+          p.y = -10; p.x = rand(0, canvas.width);
+        }
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+        ctx.restore();
+      }
+      requestAnimationFrame(step);
+    }
+    step();
+  })();
+  </script>
+{% endblock %}
+
