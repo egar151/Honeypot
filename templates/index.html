@@ -1,7 +1,22 @@
 {% extends 'base.html' %}
 {% block content %}
   <div class="panel">
-    <p>Welcome. Please <a href="{{ url_for('login') }}">log in</a> to continue.</p>
+    <h2>Welcome</h2>
+    <p>
+      This is the service portal. Access documentation, status, and account settings.
+      Administrators can sign in to manage configuration and review activity.
+    </p>
+    <p>
+      Proceed to <a href="{{ url_for('login') }}">Sign in</a>.
+    </p>
+  </div>
+
+  <div class="panel" style="margin-top:16px;">
+    <h3>System Status</h3>
+    <ul class="muted" style="margin:0; padding-left:18px;">
+      <li>API: Operational</li>
+      <li>Database: Healthy</li>
+      <li>Auth: Degraded (intermittent)</li>
+    </ul>
   </div>
 {% endblock %}
-

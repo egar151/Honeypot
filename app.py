@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import random
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from flask import (
@@ -48,7 +50,9 @@ def init_db():
             referrer TEXT,
             headers_json TEXT,
             content_type TEXT,
-            body_snippet TEXT
+            body_snippet TEXT,
+            first_visit_ever INTEGER NOT NULL DEFAULT 0,
+            first_visit_today INTEGER NOT NULL DEFAULT 0
         );
         """
     )
@@ -90,6 +94,30 @@ def init_db():
         """
     )
 
+    conn.commit()
+    # Backfill/migrate: ensure new columns exist
+    def ensure_column(table: str, name: str, ddl: str):
+        cur.execute(f"PRAGMA table_info({table});")
+        cols = [r[1] for r in cur.fetchall()]
+        if name not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl};")
+            conn.commit()
+
+    ensure_column("requests", "first_visit_ever", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column("requests", "first_visit_today", "INTEGER NOT NULL DEFAULT 0")
+
+    # Whitelist for admin access via URL knocking
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS whitelist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT,
+            session_id TEXT,
+            created_utc TEXT NOT NULL,
+            expires_utc TEXT
+        );
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -161,16 +189,37 @@ def log_request(conn: sqlite3.Connection):
     except Exception:
         pass
 
+    # Determine first-visit signals (by ip + user agent)
+    ip_val = client_ip()
+    ua_val = request.headers.get("User-Agent", "")
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(1) FROM requests WHERE ip = ? AND user_agent = ?",
+        (ip_val, ua_val),
+    )
+    total_for_actor = int(cur.fetchone()[0])
+    first_visit_ever = 1 if total_for_actor == 0 else 0
+
+    # First visit today (UTC)
+    now_dt = datetime.now(timezone.utc)
+    start_of_day = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=timezone.utc)
+    cur.execute(
+        "SELECT COUNT(1) FROM requests WHERE ip = ? AND user_agent = ? AND ts_utc >= ?",
+        (ip_val, ua_val, start_of_day.isoformat()),
+    )
+    total_today = int(cur.fetchone()[0])
+    first_visit_today = 1 if total_today == 0 else 0
+
     conn.execute(
         """
         INSERT INTO requests (
             ts_utc, ip, remote_port, local_port, method, scheme, host, path, query_string,
-            user_agent, referrer, headers_json, content_type, body_snippet
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            user_agent, referrer, headers_json, content_type, body_snippet, first_visit_ever, first_visit_today
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             utcnow_iso(),
-            client_ip(),
+            ip_val,
             remote_port,
             local_port,
             request.method,
@@ -178,11 +227,13 @@ def log_request(conn: sqlite3.Connection):
             request.host,
             request.path,
             request.query_string.decode("utf-8", errors="replace") if isinstance(request.query_string, (bytes, bytearray)) else str(request.query_string),
-            request.headers.get("User-Agent", ""),
+            ua_val,
             request.referrer or "",
             headers_json,
             request.headers.get("Content-Type", ""),
             body_snippet,
+            first_visit_ever,
+            first_visit_today,
         ),
     )
     conn.commit()
@@ -191,9 +242,32 @@ def log_request(conn: sqlite3.Connection):
 app = Flask(__name__)
 app.secret_key = os.environ.get("HONEYPOT_SECRET", os.urandom(24))
 
+# Knock configuration
+def _knock_sequence() -> list[str]:
+    raw = os.environ.get("KNOCK_SEQUENCE", "/knock/one,/knock/two,/knock/three")
+    seq = [s.strip() for s in raw.split(",") if s.strip()]
+    # Normalize to paths starting with '/'
+    seq = [p if p.startswith("/") else f"/{p}" for p in seq]
+    return seq
+
+def _knock_window_seconds() -> int:
+    try:
+        return int(os.environ.get("KNOCK_WINDOW_SEC", "60"))
+    except Exception:
+        return 60
+
+def _whitelist_hours() -> int:
+    try:
+        return int(os.environ.get("KNOCK_WHITELIST_HOURS", "12"))
+    except Exception:
+        return 12
+
 
 @app.before_request
 def _before_request_log():
+    # Exclude style.css from request logging as requested
+    if request.path == "/static/style.css":
+        return
     conn = get_db()
     log_request(conn)
 
@@ -212,7 +286,7 @@ def _teardown_request(exc):
 
 @app.route("/")
 def index():
-    return redirect(url_for("login"))
+    return render_template("index.html")
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -299,19 +373,76 @@ def welcome():
 
 
 def _admin_authorized() -> bool:
+    # If whitelisted by session
+    if session.get("admin_whitelisted"):
+        return True
+
+    # If whitelisted by IP and not expired
+    try:
+        conn = get_db()
+        now_iso = utcnow_iso()
+        cur = conn.execute(
+            "SELECT 1 FROM whitelist WHERE (ip = ? OR (session_id IS NOT NULL AND session_id = ?)) AND (expires_utc IS NULL OR expires_utc > ?) LIMIT 1",
+            (client_ip(), session.get("sid", ""), now_iso),
+        )
+        if cur.fetchone():
+            return True
+    except Exception:
+        pass
+
+    # Fallback to token auth if configured
     required = os.environ.get("HONEYPOT_ADMIN_TOKEN")
     if not required:
-        return True
+        return False
     provided = request.args.get("token") or request.headers.get("X-Admin-Token")
     return provided == required
 
 
-@app.route("/admin")
+@app.route("/admin", methods=["GET", "POST"])
 def admin():
     if not _admin_authorized():
         return ("Forbidden", 403)
 
     conn = get_db()
+    purge_ok = False
+    purge_error = None
+    wl_removed = None
+    wl_error = None
+
+    # Handle purge action
+    if request.method == "POST" and (request.form.get("action") == "purge"):
+        supplied = (request.form.get("confirm") or "").strip()
+        today_pwd = datetime.now().strftime("%m%d%Y")
+        if supplied == today_pwd:
+            try:
+                # Purge logs and attempts. Keep whitelist intact.
+                conn.execute("DELETE FROM requests;")
+                conn.execute("DELETE FROM login_attempts;")
+                conn.execute("DELETE FROM actors;")
+                conn.commit()
+                purge_ok = True
+            except Exception as e:
+                purge_error = f"Failed to purge: {e}"
+        else:
+            purge_error = "Invalid password."
+
+    # Handle whitelist removal
+    if request.method == "POST" and (request.form.get("action") == "del_whitelist"):
+        try:
+            wid = int(request.form.get("id") or 0)
+        except Exception:
+            wid = 0
+        if wid > 0:
+            try:
+                cur = conn.execute("DELETE FROM whitelist WHERE id = ?", (wid,))
+                conn.commit()
+                wl_removed = wid if cur.rowcount else None
+                if wl_removed is None:
+                    wl_error = "Record not found."
+            except Exception as e:
+                wl_error = f"Failed to remove: {e}"
+        else:
+            wl_error = "Invalid id."
     # Filters
     ip = (request.args.get("ip") or "").strip()
     ua = (request.args.get("ua") or "").strip()
@@ -349,7 +480,7 @@ def admin():
             conds.append("ts_utc >= ?")
             args.append(since_iso)
         sql = (
-            "SELECT id, ts_utc, ip, remote_port, local_port, method, scheme, host, path, query_string, user_agent, referrer "
+            "SELECT id, ts_utc, ip, remote_port, local_port, method, scheme, host, path, query_string, user_agent, referrer, first_visit_ever, first_visit_today "
             f"FROM requests WHERE {' AND '.join(conds)} ORDER BY id DESC LIMIT ?"
         )
         args.append(limit)
@@ -379,10 +510,22 @@ def admin():
         cur = conn.execute(sql, tuple(args))
         login_rows = cur.fetchall()
 
+    # Whitelist entries (authorized devices/sessions)
+    try:
+        now_iso = utcnow_iso()
+        cur = conn.execute(
+            "SELECT id, ip, session_id, created_utc, expires_utc, CASE WHEN (expires_utc IS NULL OR expires_utc > ?) THEN 1 ELSE 0 END AS active FROM whitelist ORDER BY id DESC LIMIT ?",
+            (now_iso, limit),
+        )
+        whitelist_rows = cur.fetchall()
+    except Exception:
+        whitelist_rows = []
+
     return render_template(
         "admin.html",
         req_rows=req_rows,
         login_rows=login_rows,
+        whitelist_rows=whitelist_rows,
         ip=ip,
         ua=ua,
         path_q=path_q,
@@ -390,7 +533,163 @@ def admin():
         hours=hours,
         limit=limit,
         token_provided=bool(request.args.get("token") or request.headers.get("X-Admin-Token")),
+        purge_ok=purge_ok,
+        purge_error=purge_error,
+        wl_removed=wl_removed,
+        wl_error=wl_error,
     )
+
+
+def _ensure_session_id():
+    if not session.get("sid"):
+        session["sid"] = secrets.token_hex(16)
+
+
+def _knock_progress_reset():
+    session.pop("knock_idx", None)
+    session.pop("knock_started", None)
+
+
+def _handle_knock_sequence(path: str):
+    # Return True if we should short-circuit (e.g., after completing knocks) or False to continue
+    seq = _knock_sequence()
+    if not seq:
+        return False
+
+    _ensure_session_id()
+    now = datetime.now(timezone.utc)
+    idx = int(session.get("knock_idx", 0))
+    started_iso = session.get("knock_started")
+    started = None
+    if started_iso:
+        try:
+            started = datetime.fromisoformat(started_iso)
+        except Exception:
+            started = None
+
+    # If window expired, reset
+    if started and (now - started).total_seconds() > _knock_window_seconds():
+        _knock_progress_reset()
+        idx = 0
+        started = None
+
+    expected = seq[idx] if idx < len(seq) else None
+    if expected and path == expected:
+        # Progress sequence
+        if idx == 0:
+            session["knock_started"] = now.isoformat()
+        session["knock_idx"] = idx + 1
+        if idx + 1 >= len(seq):
+            # Completed within window — whitelist
+            expires = now + timedelta(hours=_whitelist_hours())
+            try:
+                conn = get_db()
+                conn.execute(
+                    "INSERT INTO whitelist (ip, session_id, created_utc, expires_utc) VALUES (?, ?, ?, ?)",
+                    (client_ip(), session.get("sid"), now.isoformat(), expires.isoformat()),
+                )
+                conn.commit()
+            except Exception:
+                pass
+            session["admin_whitelisted"] = True
+            _knock_progress_reset()
+        # Respond minimally to knocks to avoid attention
+        return True
+    return False
+
+
+def _random_file_response(path: str):
+    # Generate realistic-looking text content depending on extension or random template
+    name = os.path.basename(path.strip("/")) or "index"
+    exts = [".log", ".txt", ".csv", ".conf", ".ini", ".json"]
+    ext = os.path.splitext(name)[1]
+    if not ext:
+        ext = random.choice(exts)
+        name = name + ext
+
+    now = datetime.now(timezone.utc)
+    host = request.host or "localhost"
+    ip = client_ip()
+
+    def gen_log():
+        lines = []
+        for i in range(random.randint(30, 120)):
+            ts = (now - timedelta(seconds=random.randint(0, 3600))).strftime("%Y-%m-%d %H:%M:%S")
+            lvl = random.choice(["INFO", "WARN", "ERROR", "DEBUG"])
+            mod = random.choice(["auth", "db", "api", "nginx", "system"]) 
+            msg = random.choice([
+                "accepted connection",
+                "authentication failed for user",
+                "executed query",
+                "cache miss",
+                "request completed",
+                "permission denied",
+                "rotating keys",
+            ])
+            lines.append(f"{ts} {lvl} {mod}: {msg}")
+        return "\n".join(lines) + "\n"
+
+    def gen_csv():
+        headers = ["id", "name", "email", "role", "last_login"]
+        rows = [",".join(headers)]
+        for i in range(1, random.randint(20, 80)):
+            rows.append(f"{i},User {i},user{i}@{host.split(':')[0]},user,{(now - timedelta(days=random.randint(0,90))).date()}")
+        return "\n".join(rows) + "\n"
+
+    def gen_conf():
+        blocks = [
+            "[server]\nport=8080\nhost=0.0.0.0\n",
+            f"[database]\nengine=sqlite\npath={DB_PATH}\n",
+            f"[auth]\nprovider=internal\nrate_limit={random.randint(5,20)}/min\n",
+        ]
+        return "\n".join(blocks)
+
+    def gen_json():
+        sample = {
+            "service": "api",
+            "version": "v1",
+            "host": host,
+            "timestamp": now.isoformat(),
+            "status": "ok",
+            "client": {"ip": ip, "ua": request.headers.get("User-Agent", "")},
+        }
+        return json.dumps(sample, indent=2) + "\n"
+
+    content = ""
+    if ext == ".csv":
+        content = gen_csv()
+        mime = "text/csv"
+    elif ext == ".json":
+        content = gen_json()
+        mime = "application/json"
+    elif ext in (".conf", ".ini"):
+        content = gen_conf()
+        mime = "text/plain"
+    else:
+        content = gen_log()
+        mime = "text/plain"
+
+    from flask import Response
+    resp = Response(content, mimetype=mime)
+    resp.headers["Content-Disposition"] = f"inline; filename={name}"
+    return resp
+
+
+@app.route("/<path:anypath>")
+def catch_all(anypath: str):
+    # Normalize path with leading '/'
+    path = "/" + anypath
+    # First: process knock sequence
+    if _handle_knock_sequence(path):
+        # Return generic not found to stay inconspicuous
+        return ("Not Found", 404)
+
+    # Known routes should not be shadowed (Flask routing handles this already),
+    # but for safety, avoid mimicking our main endpoints.
+    if path in ("/login", "/welcome", "/admin"):
+        return redirect(path)
+    # Serve a realistic random text file for any other path
+    return _random_file_response(path)
 
 
 if __name__ == "__main__":

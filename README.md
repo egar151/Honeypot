@@ -1,12 +1,14 @@
-# Honeypot / Sinkhole App
+# Sinkhole App
 
-A minimal honeypot web application that:
+A minimal web sinkhole application that:
 
 - Logs every HTTP request (IP, remote/local ports, headers, method, path, body snippet).
 - Provides a dummy login page and records each login attempt in plain text.
 - Counts attempts per actor (identified by IP + User‑Agent) and, after 20 unsuccessful attempts, allows login on the 21st attempt and shows a confetti “break‑in” page.
 - Resets the failed-attempt counter if there is no attempt for 15 minutes, while flagging that attempt as a repeater.
 - Stores all data in a local SQLite database with safe, parameterized queries.
+- Serves realistic random text files (log/csv/conf/json) for unknown URLs to look plausible.
+- Tracks whether a request is the first‑ever or first‑today visit for an IP+User‑Agent.
 
 ## Tech stack
 
@@ -32,7 +34,7 @@ A minimal honeypot web application that:
 
 3. Visit:
 
-   - http://localhost:8080/ (redirects to `/login`)
+   - http://localhost:8080/ (homepage with link to Sign in)
 
 The app creates `honeypot.db` in the project root on first run.
 
@@ -77,16 +79,22 @@ Steps:
 - 15‑minute reset: If idle ≥ 15 minutes since `last_attempt_utc`, resets `fail_count` to 0, increments `repeater_count`, and flags next attempt as repeater.
 - Safety: All DB writes use parameterized queries. The UI does not echo user input back to pages. Jinja auto‑escaping is enabled by default.
 
-## Read-only admin page
+## Admin page
 
 - URL: `/admin`
+- Access control:
+  - Whitelist via URL knocking: visit a specific sequence of URLs within a short time window to whitelist your IP/session.
+  - Optional access token: set `HONEYPOT_ADMIN_TOKEN` and supply via `?token=...` or header `X-Admin-Token`.
+  - You must be whitelisted or provide a valid token; otherwise you get 403.
 - Filters: IP, User-Agent (contains), Path (contains), last N hours (default 24), limit.
-- Shows recent Requests and Login Attempts tables.
-- Optional access token: set env var `HONEYPOT_ADMIN_TOKEN` and supply it via query `?token=...` or header `X-Admin-Token`.
+- Tables: Recent Requests and Login Attempts. Requests include flags for FirstEver and FirstToday.
+- Danger Zone: purge collected data (see Purge section below).
+- Authorized Devices: list of current whitelist entries (IP/session, created, expiry, active) with a Remove action.
 
 ## Usage
 
-- Visiting any URL logs a request row automatically (method, path, ports, headers, body snippet).
+- Visiting most URLs logs a request row automatically (method, path, ports, headers, body snippet). Requests to `/static/style.css` are excluded from logging.
+- Unknown paths serve realistic text content (e.g., `/logs/app.log`, `/export/users.csv`, `/config/service.conf`).
 - Go to `/login` and submit credentials; each attempt is recorded with `username`, `password`, `attempt_number`, and `repeater` flag.
 - Attempts 1–20 always fail; attempt ≥ 21 succeeds and redirects to `/welcome` with confetti.
 - Browse data at `/admin` (read-only). Use filters to narrow by IP, User-Agent, path, time window, and limit.
@@ -102,7 +110,10 @@ Environment variables:
 
 - `PORT`: Server port (default `8080`). Example: `export PORT=9000`.
 - `HONEYPOT_SECRET`: Flask session secret. Set this to a long, random, static value in production so sessions are stable across restarts. Example: `export HONEYPOT_SECRET=$(python -c 'import secrets; print(secrets.token_hex(32))')`.
-- `HONEYPOT_ADMIN_TOKEN`: Optional token required to view `/admin`. Provide via query `?token=...` or header `X-Admin-Token`. If unset, `/admin` is open. Strongly recommended to set in any networked deployment.
+- `HONEYPOT_ADMIN_TOKEN`: Optional token to access `/admin`. Provide via query `?token=...` or header `X-Admin-Token`. If unset, you must whitelist via URL knocking.
+- `KNOCK_SEQUENCE`: Comma-separated URL paths to visit in order to whitelist (default: `/knock/one,/knock/two,/knock/three`). Example: `export KNOCK_SEQUENCE="/s1,/s2,/s3"`.
+- `KNOCK_WINDOW_SEC`: Seconds allowed to complete the sequence (default: `60`).
+- `KNOCK_WHITELIST_HOURS`: Hours to keep IP/session whitelisted (default: `12`).
 
 Reverse proxy and IP handling:
 
@@ -154,7 +165,7 @@ Gunicorn behind Nginx (Ubuntu-like setup):
 ```
 server {
     listen 80;
-    server_name honeypot.example.com;
+server_name sink.example.com;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -163,7 +174,7 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # Optional: restrict admin
+    # Optional: extra restrict admin at proxy
     location /admin {
         allow 10.0.0.0/8; # your network
         deny all;
@@ -181,16 +192,16 @@ Systemd unit (optional):
 
 ```
 [Unit]
-Description=Honeypot
+Description=Sinkhole App
 After=network.target
 
 [Service]
-User=honeypot
-WorkingDirectory=/opt/honeypot
+User=sink
+WorkingDirectory=/opt/sink
 Environment=PORT=8080
 Environment=HONEYPOT_ADMIN_TOKEN=change-me
 Environment=HONEYPOT_SECRET=change-me-long-random
-ExecStart=/opt/honeypot/.venv/bin/gunicorn -w 2 -b 127.0.0.1:8080 app:app
+ExecStart=/opt/sink/.venv/bin/gunicorn -w 2 -b 127.0.0.1:8080 app:app
 Restart=always
 
 [Install]
@@ -201,10 +212,11 @@ WantedBy=multi-user.target
 
 - `Address already in use`: Change `PORT` or stop other processes bound to the same port.
 - `sqlite3` not found: Install SQLite CLI or just use the app; Python includes the library already.
-- Admin 403: Ensure you set `HONEYPOT_ADMIN_TOKEN` and passed `?token=...` or `X-Admin-Token` header.
+- Admin 403: Complete the URL-knock sequence within the window (see env vars) to whitelist your IP/session, or set `HONEYPOT_ADMIN_TOKEN` and pass `?token=...` or `X-Admin-Token`.
+- Whitelist removal: Use the Remove button in the Authorized Devices panel to revoke access for that IP/session.
 - No IP in logs behind proxy: Confirm your reverse proxy sets `X-Forwarded-For` and only your proxy can reach the app.
 
-## Purge or reset the database
+## Purge or reset the data
 
 Fully delete the database file (fresh start):
 
@@ -229,6 +241,11 @@ Wipe contents but keep the file (optional):
 
 - `sqlite3 honeypot.db "DELETE FROM requests; DELETE FROM login_attempts; DELETE FROM actors; VACUUM;"`
 
+Admin Purge button (UI):
+
+- Open `/admin` and scroll to the Danger Zone.
+- Confirm with the password and submit to purge all Requests, Login Attempts, and Actors. Whitelist records are retained.
+
 ## Legal
 
 - Product of Chimera Labs.
@@ -238,13 +255,13 @@ Wipe contents but keep the file (optional):
 
 ## Database schema
 
-Tables are created automatically on start:
+Tables are created automatically on start (and migrated when needed):
 
-- `requests(id, ts_utc, ip, remote_port, local_port, method, scheme, host, path, query_string, user_agent, referrer, headers_json, content_type, body_snippet)`
+- `requests(id, ts_utc, ip, remote_port, local_port, method, scheme, host, path, query_string, user_agent, referrer, headers_json, content_type, body_snippet, first_visit_ever, first_visit_today)`
 - `actors(id, ip, user_agent, fail_count, repeater_count, first_seen_utc, last_seen_utc, last_attempt_utc)`
 - `login_attempts(id, actor_id, ts_utc, username, password, success, attempt_number, repeater, reason)`
+- `whitelist(id, ip, session_id, created_utc, expires_utc)`
 
 ## Notes
 
-- This is a honeypot: never place behind real auth or connect it to production networks. If deploying behind a proxy/load balancer, ensure it forwards `X-Forwarded-For` correctly.
-- If you want an admin view to browse logs, I can add a read-only web UI filtered by IP/time windows.
+- This is a sinkhole/honeypot for observation. Do not place behind real auth or connect it to production networks. If deploying behind a proxy/load balancer, ensure it forwards `X-Forwarded-For` correctly.

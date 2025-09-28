@@ -4,6 +4,8 @@
     /* Make admin page wider and prevent truncation */
     .container { max-width: 1200px; }
     .table .truncate { max-width: none; white-space: normal; }
+    .danger { background:#2b1b1b; border:1px solid #8a2b2b; }
+    .danger button { background: var(--danger); color: #000; }
   </style>
   <div class="panel">
     <h2>Admin — Read Only</h2>
@@ -40,6 +42,28 @@
     </form>
   </div>
 
+  {% if purge_ok %}
+    <div class="panel" style="border-color:#2a4; background:#132a13;">
+      <strong>Purged.</strong> All requests, login attempts, and actors were deleted.
+    </div>
+  {% elif purge_error %}
+    <div class="panel alert">
+      {{ purge_error }}
+    </div>
+  {% endif %}
+
+  <div class="panel danger">
+    <h3>Danger Zone</h3>
+    <p class="muted">Delete all collected data (requests, login attempts, actors). This action cannot be undone.</p>
+    <form method="post" action="{{ url_for('admin') }}" onsubmit="return confirm('This will permanently delete records. Continue?')">
+      <input type="hidden" name="action" value="purge" />
+      <label>Confirm password
+        <input type="password" name="confirm" autocomplete="off" />
+      </label>
+      <button type="submit">Purge Data</button>
+    </form>
+  </div>
+
   {% if qtype in ['both','requests'] %}
   <div class="panel">
     <h3>Recent Requests</h3>
@@ -47,7 +71,7 @@
       <table class="table">
         <thead>
           <tr>
-            <th>ID</th><th>Time (UTC)</th><th>IP:Port</th><th>Local</th><th>Method</th><th>Host</th><th>Path</th><th>Query</th><th>UA</th>
+            <th>ID</th><th>Time (UTC)</th><th>IP:Port</th><th>Local</th><th>Method</th><th>Host</th><th>Path</th><th>Query</th><th>UA</th><th>FirstEver</th><th>FirstToday</th>
           </tr>
         </thead>
         <tbody>
@@ -62,6 +86,8 @@
             <td class="mono">{{ r['path'] }}</td>
             <td class="mono">{{ r['query_string'] }}</td>
             <td class="mono truncate" title="{{ r['user_agent'] }}">{{ r['user_agent'] }}</td>
+            <td>{{ 'yes' if r['first_visit_ever'] else '' }}</td>
+            <td>{{ 'yes' if r['first_visit_today'] else '' }}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -69,6 +95,49 @@
     </div>
   </div>
   {% endif %}
+
+  <div class="panel">
+    <h3>Authorized Devices</h3>
+    {% if wl_removed %}
+      <div class="alert">Removed whitelist entry ID {{ wl_removed }}.</div>
+    {% elif wl_error %}
+      <div class="alert">{{ wl_error }}</div>
+    {% endif %}
+    <div class="table-wrap">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>IP</th>
+            <th>Session</th>
+            <th>Created (UTC)</th>
+            <th>Expires (UTC)</th>
+            <th>Active</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for w in whitelist_rows %}
+          <tr>
+            <td>{{ w['id'] }}</td>
+            <td class="mono">{{ w['ip'] or '' }}</td>
+            <td class="mono truncate" title="{{ w['session_id'] or '' }}">{{ (w['session_id'] or '')[:16] }}{% if (w['session_id'] or '')|length > 16 %}…{% endif %}</td>
+            <td class="mono">{{ w['created_utc'] }}</td>
+            <td class="mono">{{ w['expires_utc'] or '' }}</td>
+            <td>{{ 'yes' if w['active'] else '' }}</td>
+            <td>
+              <form method="post" action="{{ url_for('admin') }}" style="display:inline" onsubmit="return confirm('Remove this authorized device?')">
+                <input type="hidden" name="action" value="del_whitelist" />
+                <input type="hidden" name="id" value="{{ w['id'] }}" />
+                <button type="submit">Remove</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
 
   {% if qtype in ['both','logins'] %}
   <div class="panel">
